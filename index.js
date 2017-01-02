@@ -1,72 +1,65 @@
 #! /usr/bin/env node
+'use strict'
 
-var AWS = require('aws-sdk');
-var argv = require('yargs').env('AWS').argv;
-var Consumer = require('sqs-consumer');
-var debug = require('debug')('sqs-to-lambda');
+const pkg = require('./package')
+const AWS = require('aws-sdk')
+const Consumer = require('@leonardodino/sqs-consumer')
+const _Debug = require('debug')
 
-var region = argv.region;
-var queueUrl = argv.queueUrl;
-var functionName = argv.functionName;
+const debug = _Debug(pkg.name)
+const receive = _Debug(`${pkg.name}:receive`)
 
-if(typeof queueUrl === 'object') {
-  queueUrl = queueUrl[0];
-}
-if(typeof region === 'object') {
-  region = region[0];
-}
-if(typeof functionName === 'object') {
-  functionName = functionName[0];
-}
+const ENV = process.env || {}
+const region = ENV['AWS_REGION']
+const queueUrl = ENV['AWS_SQS_QUEUE_URL']
+const FunctionName = ENV['AWS_LAMBDA_FUNCTION_NAME'] //CamelCase
 
-if (!region || !queueUrl || !functionName) {
-  console.log('Usage: sqs-to-lambda --queue-url <queue-url> --function-name <function-name> --region <region>');
-  process.exit();
-}
+HANDLE_MISSING_REQUIRED_PARAMETERS(region, queueUrl, FunctionName)
 
-var app = new Consumer({
-  queueUrl: queueUrl,
-  region: region,
-  handleMessage: handleMessage
-});
+const lambda = new AWS.Lambda({region, apiVersion: '2015-03-31'})
 
-var lambda = new AWS.Lambda({
-  region: region
-});
+const consumer = new Consumer({
+  region,
+  queueUrl,
+  handleMessage,
+  custom: true,
+  messageAttributeNames: ['All'],
+})
 
-function handleMessage(message, done) {
-  lambda.invokeAsync({
-    FunctionName: functionName,
-    InvokeArgs: message.Body
-  }, function (err, res) {
-    if (err) {
-      debug('Failed to invoke function for message %s', message.MessageId);
-      debug(err);
-      return done(err);
-    }
+consumer.on('error', ({message}) => console.error(message))
+consumer.on('processing_error', ({message}) => console.error(message))
 
-    debug('Function invoked for message %s', message.MessageId);
-    debug(res);
-    done();
-  });
-}
+// start
+console.log(`> Starting ${pkg.name} v${pkg.version}`)
 
-function verifyLambdaFunction(cb) {
-  lambda.getFunction({
-    FunctionName: functionName
-  }, cb);
+lambda.getFunction({FunctionName}, (err) => {
+  if(err){return HANDLE_FUNCTION_NOT_FOUND()}
+  consumer.start()
+})
+
+// message handler
+function handleMessage({MessageId, ReceiptHandle, Body, MessageAttributes, QueueUrl}, done){
+  const message = {MessageId, ReceiptHandle, Body, MessageAttributes, QueueUrl}
+  const Payload = JSON.stringify(message)
+
+  receive(Payload)
+  lambda.invoke({
+    Payload,
+    FunctionName,
+    InvocationType: 'Event',
+  }, done)
 }
 
-app.on('error', function (err) {
-  console.error(err.message);
-});
+// error handlers
+function HANDLE_FUNCTION_NOT_FOUND(err){
+  console.error('Could not get Lambda function with name', FunctionName + ':')
+  console.error('  ' + err.message)
+  process.exit(1)
+}
 
-verifyLambdaFunction(function (err) {
-  if (err) {
-    console.error('Could not get Lambda function with name', functionName + ':', err.message);
-    process.exit(1);
-  }
-
-  debug('Starting polling for SQS messages');
-  app.start();
-});
+function HANDLE_MISSING_REQUIRED_PARAMETERS(...required){
+  if(!required.some(x=>!x)){return}
+  console.error('Missing required Environment constiables:')
+  console.error('  [AWS_REGION, AWS_SQS_QUEUE_URL, AWS_LAMBDA_FUNCTION_NAME]')
+  process.exit(1)
+}
